@@ -1,0 +1,156 @@
+#! /usr/bin/env python3
+import nftables
+import json
+import sys
+import os
+
+
+def nftables_list(nftables, object):
+    rc, output, error = nftables.cmd(f'list {object}')
+    if rc != 0:
+        print(f"Error running 'list {object}'!\nError: {error}", file=sys.stderr)
+        exit(rc)
+    return json.loads(output)
+
+
+def build_rule(guest_ip, host_ip, guest_port, host_port, protocol):
+    dnat = dict(addr=guest_ip)
+    if guest_port != host_port:
+        dnat['port'] = guest_port
+    expr = [
+        dict(match=dict(op="==", left=dict(payload=dict(protocol=protocol, field='dport')), right=host_port)),
+        dict(match=dict(op="==", left=dict(payload=dict(protocol='ip', field='daddr')), right=host_ip)),
+        dict(dnat=dnat)
+    ]
+    rule = dict(family='ip', table='nat', chain='prerouting', expr=expr)
+    return rule
+
+
+def find_rule(nftables, rule):
+    ruleset = nftables_list(nftables, 'ruleset')
+    for entry in ruleset['nftables']:
+        if 'rule' not in entry:
+            continue
+        if rule.items() <= entry['rule'].items():
+            return entry['rule']
+
+
+def execute(nftables, cmd):
+    try:
+        nftables.json_validate(cmd)
+    except Exception as e:
+        print(f"ERROR: failed validating JSON schema: {e}")
+        exit(1)
+    rc, output, error = nftables.json_cmd(cmd)
+    if rc != 0:
+        print(f"ERROR({rc}): running JSON cmd: {error}")
+        exit(1)
+    if len(output) != 0:
+        print(f"WARNING: output: {output}")
+
+
+def nftables_cmd():
+    return dict(nftables=[dict(metainfo=dict(json_schema_version=1))])
+
+
+def stopped(nftables, mapping):
+    delete_cmd = nftables_cmd()
+
+    host_ip = mapping['host_ip']
+    guest_ip = mapping['guest_ip']
+    for port_entry in mapping['ports']:
+        host_port = port_entry['host']
+        guest_port = port_entry['guest'] if 'guest' in port_entry else host_port
+        protocol = port_entry['protocol']
+
+        built_rule = build_rule(guest_ip, host_ip, guest_port, host_port, protocol)
+        running_rule = find_rule(nftables, built_rule)
+        if running_rule is not None:
+            delete_cmd['nftables'].append(
+                dict(delete=dict(rule=running_rule))
+            )
+    execute(nftables, delete_cmd)
+
+
+def started(nftables, mapping):
+    add_cmd = nftables_cmd()
+
+    host_ip = mapping['host_ip']
+    guest_ip = mapping['guest_ip']
+    for port_entry in mapping['ports']:
+        host_port = port_entry['host']
+        guest_port = port_entry['guest'] if 'guest' in port_entry else host_port
+        protocol = port_entry['protocol']
+
+        built_rule = build_rule(guest_ip, host_ip, guest_port, host_port, protocol)
+        running_rule = find_rule(nftables, built_rule)
+        if running_rule is None:
+            add_cmd['nftables'].append(
+                dict(add=dict(rule=built_rule))
+            )
+    execute(nftables, add_cmd)
+
+
+def create_table_and_chains(nftables, mapping):
+    to_add = []
+    expected_table = dict(table=dict(family='ip', name='nat'))
+    expected_prerouting = dict(chain=dict(family='ip', table='nat', name='prerouting', type='nat',
+                                          hook='prerouting', prio=-100, policy='accept'))
+    expected_postrouting = dict(chain=dict(family='ip', table='nat', name='postrouting', type='nat',
+                                           hook='postrouting', prio=100, policy='accept'))
+    saddr = mapping['guest_ip'].rsplit('.', 1)[0] + '.0'
+    snat_addr = mapping['host_ip']
+    expected_snat_rule = dict(family='ip', table='nat', chain='postrouting',
+                                   expr=[
+                                       dict(match=dict(op='==',
+                                                       left=dict(payload=dict(protocol='ip', field='saddr')),
+                                                       right=dict(prefix=dict(addr=saddr, len=24))
+                                                       )
+                                            ),
+                                       dict(snat=dict(addr=snat_addr))
+                                   ])
+
+    ruleset = nftables_list(nftables, 'ruleset')['nftables']
+
+    def in_ruleset(input_entry):
+        return any(entry for entry in ruleset if input_entry.items() <= entry.items())
+
+    if not in_ruleset(expected_table):
+        to_add.append(dict(add=expected_table))
+    if not in_ruleset(expected_prerouting):
+        to_add.append(dict(add=expected_prerouting))
+    if not in_ruleset(expected_postrouting):
+        to_add.append(dict(add=expected_postrouting))
+    if not find_rule(nftables, expected_snat_rule):
+        to_add.append(dict(add=dict(rule=expected_snat_rule)))
+
+    if len(to_add) > 0:
+        create_cmd = nftables_cmd()
+        create_cmd['nftables'].extend(to_add)
+        execute(nftables, create_cmd)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 4:
+        print("This script is supposed to be called by libvirt as a hook for qemu", file=sys.stderr)
+        exit(1)
+
+    nftables = nftables.Nftables()
+    nftables.set_json_output(True)
+    nftables.set_handle_output(True)
+
+    vm = sys.argv[1]
+    action = sys.argv[2:4]  # including sub action so the script doesn't run multiple times (although it'd still work)
+    mapping_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mapping.json')
+    with open(mapping_file, 'r') as mappingFile:
+        mapping = json.load(mappingFile)
+
+    if vm not in mapping:
+        print(f"VM '{vm}' not found in mapping, exiting")
+        exit(0)
+    create_table_and_chains(nftables, mapping[vm])
+    # by including reconnect, we reload the mapping when libvirtd is restarted
+    if (action == ['stopped', 'end']) or action == ['reconnect', 'begin']:
+        stopped(nftables, mapping[vm])
+    if action == ['start', 'begin'] or action == ['reconnect', 'begin']:
+        started(nftables, mapping[vm])
