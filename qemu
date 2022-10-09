@@ -13,7 +13,19 @@ def nftables_list(nftables, object):
     return json.loads(output)
 
 
-def build_rule(guest_ip, host_ip, guest_port, host_port, protocol):
+def build_prerouting_rule(guest_ip, host_ip, guest_port, host_port, protocol):
+    expr = build_expression(guest_ip, host_ip, guest_port, host_port, protocol)
+    rule = dict(family='ip', table='nat', chain='prerouting', expr=expr)
+    return rule
+
+
+def build_output_rule(guest_ip, host_ip, guest_port, host_port, protocol):
+    expr = build_expression(guest_ip, host_ip, guest_port, host_port, protocol)
+    rule = dict(family='ip', table='nat', chain='output', expr=expr)
+    return rule
+
+
+def build_expression(guest_ip, host_ip, guest_port, host_port, protocol):
     dnat = dict(addr=guest_ip)
     if guest_port != host_port:
         dnat['port'] = guest_port
@@ -22,8 +34,7 @@ def build_rule(guest_ip, host_ip, guest_port, host_port, protocol):
         dict(match=dict(op="==", left=dict(payload=dict(protocol='ip', field='daddr')), right=host_ip)),
         dict(dnat=dnat)
     ]
-    rule = dict(family='ip', table='nat', chain='prerouting', expr=expr)
-    return rule
+    return expr
 
 
 def find_rule(nftables, rule):
@@ -31,7 +42,7 @@ def find_rule(nftables, rule):
     for entry in ruleset['nftables']:
         if 'rule' not in entry:
             continue
-        if rule.items() <= entry['rule'].items():
+        if is_nested_subset(entry['rule'], rule):
             return entry['rule']
 
 
@@ -63,11 +74,17 @@ def stopped(nftables, mapping):
         guest_port = port_entry['guest'] if 'guest' in port_entry else host_port
         protocol = port_entry['protocol']
 
-        built_rule = build_rule(guest_ip, host_ip, guest_port, host_port, protocol)
-        running_rule = find_rule(nftables, built_rule)
-        if running_rule is not None:
+        prerouting_rule = build_prerouting_rule(guest_ip, host_ip, guest_port, host_port, protocol)
+        output_rule = build_output_rule(guest_ip, host_ip, guest_port, host_port, protocol)
+        running_prerouting_rule = find_rule(nftables, prerouting_rule)
+        running_output_rule = find_rule(nftables, output_rule)
+        if running_prerouting_rule is not None:
             delete_cmd['nftables'].append(
-                dict(delete=dict(rule=running_rule))
+                dict(delete=dict(rule=running_prerouting_rule))
+            )
+        if running_output_rule is not None:
+            delete_cmd['nftables'].append(
+                dict(delete=dict(rule=running_output_rule))
             )
     execute(nftables, delete_cmd)
 
@@ -82,11 +99,17 @@ def started(nftables, mapping):
         guest_port = port_entry['guest'] if 'guest' in port_entry else host_port
         protocol = port_entry['protocol']
 
-        built_rule = build_rule(guest_ip, host_ip, guest_port, host_port, protocol)
-        running_rule = find_rule(nftables, built_rule)
-        if running_rule is None:
+        prerouting_rule = build_prerouting_rule(guest_ip, host_ip, guest_port, host_port, protocol)
+        output_rule = build_output_rule(guest_ip, host_ip, guest_port, host_port, protocol)
+        running_prerouting_rule = find_rule(nftables, prerouting_rule)
+        running_output_rule = find_rule(nftables, output_rule)
+        if running_prerouting_rule is None:
             add_cmd['nftables'].append(
-                dict(add=dict(rule=built_rule))
+                dict(add=dict(rule=prerouting_rule))
+            )
+        if running_output_rule is None:
+            add_cmd['nftables'].append(
+                dict(add=dict(rule=output_rule))
             )
     execute(nftables, add_cmd)
 
@@ -98,22 +121,24 @@ def create_table_and_chains(nftables, mapping):
                                           hook='prerouting', prio=-100, policy='accept'))
     expected_postrouting = dict(chain=dict(family='ip', table='nat', name='postrouting', type='nat',
                                            hook='postrouting', prio=100, policy='accept'))
+    expected_output = dict(chain=dict(family='ip', table='nat', name='output', type='nat',
+                                      hook='output', prio=100, policy='accept'))
     saddr = mapping['guest_ip'].rsplit('.', 1)[0] + '.0'
     snat_addr = mapping['host_ip']
     expected_snat_rule = dict(family='ip', table='nat', chain='postrouting',
-                                   expr=[
-                                       dict(match=dict(op='==',
-                                                       left=dict(payload=dict(protocol='ip', field='saddr')),
-                                                       right=dict(prefix=dict(addr=saddr, len=24))
-                                                       )
-                                            ),
-                                       dict(snat=dict(addr=snat_addr))
-                                   ])
+                              expr=[
+                                  dict(match=dict(op='==',
+                                                  left=dict(payload=dict(protocol='ip', field='saddr')),
+                                                  right=dict(prefix=dict(addr=saddr, len=24))
+                                                  )
+                                       ),
+                                  dict(snat=dict(addr=snat_addr))
+                              ])
 
     ruleset = nftables_list(nftables, 'ruleset')['nftables']
 
     def in_ruleset(input_entry):
-        return any(entry for entry in ruleset if input_entry.items() <= entry.items())
+        return any(entry for entry in ruleset if is_nested_subset(entry, input_entry))
 
     if not in_ruleset(expected_table):
         to_add.append(dict(add=expected_table))
@@ -121,6 +146,8 @@ def create_table_and_chains(nftables, mapping):
         to_add.append(dict(add=expected_prerouting))
     if not in_ruleset(expected_postrouting):
         to_add.append(dict(add=expected_postrouting))
+    if not in_ruleset(expected_output):
+        to_add.append(expected_output)
     if not find_rule(nftables, expected_snat_rule):
         to_add.append(dict(add=dict(rule=expected_snat_rule)))
 
@@ -128,6 +155,19 @@ def create_table_and_chains(nftables, mapping):
         create_cmd = nftables_cmd()
         create_cmd['nftables'].extend(to_add)
         execute(nftables, create_cmd)
+
+
+def is_nested_subset(superset, subset):
+    for key in subset.keys():
+        if key not in superset:
+            return False
+        if isinstance(subset[key], dict) and isinstance(superset[key], dict):
+            if not is_nested_subset(superset[key], subset[key]):
+                return False
+        else:
+            if subset[key] != superset[key]:
+                return False
+    return True
 
 
 if __name__ == "__main__":

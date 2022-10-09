@@ -6,11 +6,11 @@ Provide port forwarding for libvirt via nftables.
 How it works
 ===
 
-The script creates a ``nat`` table, as well as a ``prerouting`` and ``postrouting`` chain, both with relevant hooks and
+The script creates a ``nat`` table, as well as a ``prerouting``, ``postrouting`` and ``output`` chain with relevant hooks and
 priorities.
 
 After that, it creates a SNAT rule for the guest IPs /24 and a DNAT rule which forwards the port. As there is no
-limitation regarding the device or IP, it also works if a vm tries to access a service hosted in another vm by the
+limitation regarding the device or IP, it also works if a vm (or the host itself) tries to access a service hosted in another vm by the
 public ip (e.g. you run git.example.com and forward requests to port 22 to vm2, vm1 can still access that by the public
 IP).
 
